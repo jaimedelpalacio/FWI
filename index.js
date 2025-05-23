@@ -1,3 +1,6 @@
+// index.js
+// Microservicio FWI para pruebas con logs de valores del raster
+
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -8,7 +11,7 @@ const gdal = require('gdal-async');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Tamaño de imagen raster WMS
+// Tamaño de la imagen raster WMS (puedes bajar para pruebas)
 const WIDTH = 800;
 const HEIGHT = 800;
 
@@ -16,7 +19,6 @@ app.use(express.json());
 
 app.post('/fwi/poligono', async (req, res) => {
   try {
-    // 1. Leer polígono y umbral del body
     const poligonoCoords = req.body.poligono;
     if (!Array.isArray(poligonoCoords) || poligonoCoords.length < 3)
       return res.status(400).json({ status: "error", message: 'Parámetro polígono inválido (debe ser array de al menos 3 puntos)' });
@@ -28,14 +30,11 @@ app.post('/fwi/poligono', async (req, res) => {
     const umbral = req.body.umbral !== undefined ? parseFloat(req.body.umbral) : 11;
     const fecha = req.body.fecha || new Date().toISOString().slice(0,10);
 
-    // 2. Calcular el bbox del polígono para pedir solo el raster necesario
     const bbox = turf.bbox(poligonoGeoJSON);
-
-    // 3. Construir la URL de descarga del raster FWI WMS
     const FWI_URL = `https://maps.effis.emergency.copernicus.eu/effis?LAYERS=ecmwf007.fwi&FORMAT=image/tiff&TRANSPARENT=true&SINGLETILE=false&SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&STYLES=&SRS=EPSG:4326&BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WIDTH=${WIDTH}&HEIGHT=${HEIGHT}&TIME=${fecha}`;
     const RASTER_PATH = path.join(__dirname, `fwi_poligono_${fecha}.tif`);
 
-    // 4. Descargar el raster si no existe ya en disco
+    // Descargar el raster si no existe
     if (!fs.existsSync(RASTER_PATH)) {
       const response = await axios({ url: FWI_URL, method: 'GET', responseType: 'stream' });
       const writer = fs.createWriteStream(RASTER_PATH);
@@ -46,11 +45,24 @@ app.post('/fwi/poligono', async (req, res) => {
       });
     }
 
-    // 5. Abrir el raster y procesar píxeles
+    // Abrir y depurar raster
     const ds = gdal.open(RASTER_PATH);
     const band = ds.bands.get(1);
     const geoTransform = ds.geoTransform;
 
+    // --- DEPURACIÓN: logea los primeros valores del raster
+    let countDebug = 0;
+    for (let px = 0; px < Math.min(ds.rasterSize.x, 10); px++) {
+      for (let py = 0; py < Math.min(ds.rasterSize.y, 10); py++) {
+        const fwi = band.pixels.get(px, py);
+        if (countDebug < 10) {
+          console.log(`DEBUG - FWI en px=${px}, py=${py}:`, fwi);
+          countDebug++;
+        }
+      }
+    }
+
+    // Filtrado habitual
     const fwiPoints = [];
     for (let px = 0; px < ds.rasterSize.x; px++) {
       for (let py = 0; py < ds.rasterSize.y; py++) {
@@ -71,7 +83,6 @@ app.post('/fwi/poligono', async (req, res) => {
       }
     }
 
-    // 6. Devolver el resultado
     res.json({
       status: "ok",
       fecha: fecha,
@@ -82,6 +93,7 @@ app.post('/fwi/poligono', async (req, res) => {
     });
 
   } catch (err) {
+    console.error('ERROR:', err);
     res.status(500).json({ status: "error", message: err.toString() });
   }
 });
