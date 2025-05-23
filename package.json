@@ -1,7 +1,7 @@
 {
   "name": "microservicio-fwi-poligono",
-  "version": "1.0.0",
-  "description": "Microservicio FWI: consulta puntos por polígono recibido vía POST (MT Neo ready)",
+  "version": "1.1.0",
+  "description": "Microservicio FWI: consulta puntos por polígono recibido vía POST, con logs para depuración",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
