@@ -1,5 +1,4 @@
-// index.js
-// Microservicio FWI para pruebas con logs de valores del raster
+// index.js - Microservicio FWI Copernicus/EFFIS (GWIS), EPSG:3857
 
 const express = require('express');
 const axios = require('axios');
@@ -11,18 +10,28 @@ const gdal = require('gdal-async');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Tamaño de la imagen raster WMS (puedes bajar para pruebas)
-const WIDTH = 800;
-const HEIGHT = 800;
+// Tamaño del raster (ajusta para más/menos puntos)
+const WIDTH = 512;
+const HEIGHT = 512;
+
+// Transformación a EPSG:3857 (Web Mercator)
+function lonLatTo3857(lon, lat) {
+  const R = 6378137.0;
+  const x = R * lon * Math.PI / 180.0;
+  const y = R * Math.log(Math.tan(Math.PI / 4.0 + lat * Math.PI / 360.0));
+  return [x, y];
+}
 
 app.use(express.json());
 
 app.post('/fwi/poligono', async (req, res) => {
   try {
+    // 1. Leer polígono y parámetros
     const poligonoCoords = req.body.poligono;
     if (!Array.isArray(poligonoCoords) || poligonoCoords.length < 3)
       return res.status(400).json({ status: "error", message: 'Parámetro polígono inválido (debe ser array de al menos 3 puntos)' });
-    // Cerrar polígono si hace falta
+
+    // Cerrar polígono si es necesario
     if (JSON.stringify(poligonoCoords[0]) !== JSON.stringify(poligonoCoords[poligonoCoords.length-1])) {
       poligonoCoords.push(poligonoCoords[0]);
     }
@@ -30,13 +39,18 @@ app.post('/fwi/poligono', async (req, res) => {
     const umbral = req.body.umbral !== undefined ? parseFloat(req.body.umbral) : 11;
     const fecha = req.body.fecha || new Date().toISOString().slice(0,10);
 
-    const bbox = turf.bbox(poligonoGeoJSON);
-    const FWI_URL = `https://maps.effis.emergency.copernicus.eu/effis?LAYERS=ecmwf007.fwi&FORMAT=image/tiff&TRANSPARENT=true&SINGLETILE=false&SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&STYLES=&SRS=EPSG:4326&BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WIDTH=${WIDTH}&HEIGHT=${HEIGHT}&TIME=${fecha}`;
-    const RASTER_PATH = path.join(__dirname, `fwi_poligono_${fecha}.tif`);
+    // 2. Calcular el bbox del polígono en EPSG:3857
+    const mercatorCoords = poligonoCoords.map(([lon, lat]) => lonLatTo3857(lon, lat));
+    const mercatorPolygon = turf.polygon([mercatorCoords]);
+    const bbox3857 = turf.bbox(mercatorPolygon);
 
-    // Descargar el raster si no existe
+    // 3. Construir la URL de descarga del raster FWI (GWIS)
+    const GWIS_URL = `https://maps.effis.emergency.copernicus.eu/gwis?service=WMS&request=GetMap&layers=ecmwf.fwi&styles=&format=image/tiff&transparent=true&version=1.1.1&singletile=false&time=${fecha}&width=${WIDTH}&height=${HEIGHT}&srs=EPSG:3857&bbox=${bbox3857.join(',')}`;
+    const RASTER_PATH = path.join(__dirname, `fwi_gwis_${fecha}.tif`);
+
+    // 4. Descargar el raster si no existe
     if (!fs.existsSync(RASTER_PATH)) {
-      const response = await axios({ url: FWI_URL, method: 'GET', responseType: 'stream' });
+      const response = await axios({ url: GWIS_URL, method: 'GET', responseType: 'stream' });
       const writer = fs.createWriteStream(RASTER_PATH);
       await new Promise((resolve, reject) => {
         response.data.pipe(writer);
@@ -45,29 +59,20 @@ app.post('/fwi/poligono', async (req, res) => {
       });
     }
 
-    // Abrir y depurar raster
+    // 5. Abrir el raster y procesar píxeles
     const ds = gdal.open(RASTER_PATH);
     const band = ds.bands.get(1);
     const geoTransform = ds.geoTransform;
 
-    // --- DEPURACIÓN: logea los primeros valores del raster
-    let countDebug = 0;
-    for (let px = 0; px < Math.min(ds.rasterSize.x, 10); px++) {
-      for (let py = 0; py < Math.min(ds.rasterSize.y, 10); py++) {
-        const fwi = band.pixels.get(px, py);
-        if (countDebug < 10) {
-          console.log(`DEBUG - FWI en px=${px}, py=${py}:`, fwi);
-          countDebug++;
-        }
-      }
-    }
-
-    // Filtrado habitual
     const fwiPoints = [];
     for (let px = 0; px < ds.rasterSize.x; px++) {
       for (let py = 0; py < ds.rasterSize.y; py++) {
-        const lon = geoTransform[0] + px * geoTransform[1] + py * geoTransform[2];
-        const lat = geoTransform[3] + px * geoTransform[4] + py * geoTransform[5];
+        // Coordenadas en EPSG:3857
+        const x = geoTransform[0] + px * geoTransform[1] + py * geoTransform[2];
+        const y = geoTransform[3] + px * geoTransform[4] + py * geoTransform[5];
+        // Convertir a lon/lat para devolverlo y para testear si está en el polígono original
+        const lon = x * 180.0 / 6378137.0 / Math.PI;
+        const lat = (2 * Math.atan(Math.exp(y / 6378137.0)) - Math.PI / 2) * 180.0 / Math.PI;
         if (!turf.booleanPointInPolygon(turf.point([lon, lat]), poligonoGeoJSON)) continue;
         const fwi = band.pixels.get(px, py);
         if (fwi >= umbral) {
@@ -99,7 +104,7 @@ app.post('/fwi/poligono', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Servicio FWI Polígono: envía POST a /fwi/poligono con {poligono, umbral, fecha}');
+  res.send('Servicio FWI Copernicus/EFFIS (GWIS) - POST a /fwi/poligono con {poligono, umbral, fecha}');
 });
 
 app.listen(PORT, () => {
